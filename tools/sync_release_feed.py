@@ -18,6 +18,7 @@ BUNDLE_ID = "com.lure.whisperpro.cld"
 LEGACY_VERSION = "0.13.0"
 LEGACY_BUILD = 17
 INSTALLERS = ("Transkript.dmg", "WhisperPRO.dmg")
+MAX_FEED_BYTES = 64 * 1024
 
 
 class PublicationError(ValueError):
@@ -41,6 +42,10 @@ def semantic_version(version):
 
 
 def validate_feed(feed, tag=None):
+    if not isinstance(feed, dict):
+        raise ValueError("Manifesto precisa ser um objeto JSON.")
+    if feed.get("notes") is not None and not isinstance(feed["notes"], str):
+        raise ValueError("Notas do manifesto precisam ser texto ou null.")
     semantic_version(feed.get("version"))
     if type(feed.get("build")) is not int or feed["build"] < 1:
         raise ValueError("Build do manifesto inválido.")
@@ -54,7 +59,16 @@ def validate_feed(feed, tag=None):
     if (url.scheme != "https" or url.netloc != "github.com" or url.query or url.fragment
             or url.path not in [prefix + name for name in INSTALLERS]):
         raise ValueError("URL do manifesto não pertence à release esperada.")
+    if len((json.dumps(feed, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")) > MAX_FEED_BYTES:
+        raise ValueError("Manifesto excede o limite de 64 KiB do aplicativo.")
     return feed
+
+
+def parse_feed(body, tag=None):
+    raw = body.encode("utf-8") if isinstance(body, str) else body
+    if len(raw) > MAX_FEED_BYTES:
+        raise ValueError("Corpo do manifesto excede o limite de 64 KiB do aplicativo.")
+    return validate_feed(json.loads(raw.decode("utf-8")), tag)
 
 
 def download_asset(tag, name, directory):
@@ -73,7 +87,7 @@ def repository_manifest():
         raise RuntimeError("Não foi possível verificar o feed anterior.")
     entry = json.loads(response.stdout)
     body = base64.b64decode(entry["content"]).decode()
-    return validate_feed(json.loads(body)), entry["sha"]
+    return parse_feed(body), entry["sha"]
 
 
 def release_manifest(release):
@@ -84,7 +98,7 @@ def release_manifest(release):
         raise ValueError("A release de referência não contém manifesto.")
     with tempfile.TemporaryDirectory(prefix="transkript-reference-") as directory:
         path = download_asset(release["tag_name"], "version.json", Path(directory))
-        feed = validate_feed(json.loads(path.read_text()), release["tag_name"])
+        feed = parse_feed(path.read_bytes(), release["tag_name"])
     name = urlsplit(feed["url"]).path.rsplit("/", 1)[1]
     if name not in assets:
         raise ValueError("O instalador do manifesto anterior está ausente.")
@@ -198,7 +212,7 @@ def prepare_release_assets(release, directory, dmg, feed):
     body = json.dumps(feed, ensure_ascii=False, indent=2) + "\n"
     if "version.json" in assets:
         existing = download_asset(tag, "version.json", directory / "existing")
-        existing_feed = validate_feed(json.loads(existing.read_text()), tag)
+        existing_feed = parse_feed(existing.read_bytes(), tag)
         for key in ("version", "build", "url", "sha256"):
             if existing_feed[key] != feed[key]:
                 raise ValueError(f"Manifesto publicado diverge do DMG: {key}")

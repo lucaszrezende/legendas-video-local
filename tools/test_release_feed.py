@@ -59,6 +59,30 @@ class ManifestTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 module.validate_feed(dict(feed(), **changes))
 
+    def test_notes_accept_only_absent_null_or_string(self):
+        for notes in [None, "", "Notas em português ✨"]:
+            module.validate_feed(dict(feed(), notes=notes))
+        absent = feed()
+        absent.pop("notes")
+        module.validate_feed(absent)
+        for notes in [12, True, {}, []]:
+            with self.subTest(notes=notes), self.assertRaises(ValueError):
+                module.validate_feed(dict(feed(), notes=notes))
+
+    def test_serialized_utf8_feed_cannot_exceed_client_limit(self):
+        candidate = dict(feed(), notes="✨" * (module.MAX_FEED_BYTES // 3))
+        with self.assertRaises(ValueError):
+            module.validate_feed(candidate)
+        with self.assertRaises(ValueError):
+            module.parse_feed(json.dumps(candidate, ensure_ascii=False).encode("utf-8"))
+
+    def test_raw_json_limit_includes_whitespace_and_allows_exact_boundary(self):
+        body = json.dumps(feed(), ensure_ascii=False).encode("utf-8")
+        boundary = body + b" " * (module.MAX_FEED_BYTES - len(body))
+        self.assertEqual(module.parse_feed(boundary), feed())
+        with self.assertRaises(ValueError):
+            module.parse_feed(boundary + b" ")
+
 
 class MonotonicTests(unittest.TestCase):
     def setUp(self):

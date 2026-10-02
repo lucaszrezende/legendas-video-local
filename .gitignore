@@ -1,0 +1,4 @@
+
+# Python release tool artifacts
+__pycache__/
+*.py[cod]
