@@ -171,6 +171,47 @@ class CompatibilityTests(unittest.TestCase):
 
 
 class PublicationStateTests(unittest.TestCase):
+    def test_first_workflow_uses_latest_manifest_and_creates_mirror(self):
+        candidate = release(assets=["Transkript.dmg", "WhisperPRO.dmg", "SHA256SUMS.txt", "version.json"])
+        existing_feed = feed()
+        body = json.dumps(existing_feed) + "\n"
+        info = {"CFBundleIdentifier": module.BUNDLE_ID, "CFBundleShortVersionString": "0.15.1", "CFBundleVersion": "20"}
+        writes = []
+
+        def command(*args):
+            self.assertIn("PUT", args)
+            writes.append(json.loads(Path(args[-1]).read_text()))
+            return "{}"
+
+        with patch.object(sys, "argv", ["sync_release_feed.py", "v0.15.1"]), \
+                patch.object(module, "gh_json", return_value=candidate), \
+                patch.object(module, "repository_manifest", return_value=None), \
+                patch.object(module, "release_manifest", return_value=existing_feed), \
+                patch.object(module, "inspect_dmg", return_value=info), \
+                patch.object(module, "digest", return_value=DIGEST), \
+                patch.object(module, "prepare_release_assets", return_value=(body, [])), \
+                patch.object(module.subprocess, "run"), patch.object(module, "command", side_effect=command):
+            module.main()
+        self.assertEqual(len(writes), 1)
+        self.assertNotIn("sha", writes[0])
+        self.assertEqual(writes[0]["branch"], "main")
+        self.assertEqual(json.loads(module.base64.b64decode(writes[0]["content"])), existing_feed)
+
+    def test_repeated_workflow_accepts_identical_manifest_without_rewriting_mirror(self):
+        candidate = release(assets=["Transkript.dmg", "WhisperPRO.dmg", "SHA256SUMS.txt", "version.json"])
+        existing_feed = feed()
+        info = {"CFBundleIdentifier": module.BUNDLE_ID, "CFBundleShortVersionString": "0.15.1", "CFBundleVersion": "20"}
+        with patch.object(sys, "argv", ["sync_release_feed.py", "v0.15.1"]), \
+                patch.object(module, "gh_json", return_value=candidate), \
+                patch.object(module, "repository_manifest", return_value=(existing_feed, "git-file-sha")), \
+                patch.object(module, "inspect_dmg", return_value=info), \
+                patch.object(module, "digest", return_value=DIGEST), \
+                patch.object(module, "prepare_release_assets", return_value=(json.dumps(existing_feed), [])), \
+                patch.object(module.subprocess, "run") as run, patch.object(module, "command") as command:
+            module.main()
+        command.assert_not_called()
+        self.assertFalse(any("upload" in call.args[0] for call in run.call_args_list))
+
     def test_draft_and_prerelease_never_download_or_publish(self):
         for flag in ["draft", "prerelease"]:
             candidate = release(assets=["Transkript.dmg"])
