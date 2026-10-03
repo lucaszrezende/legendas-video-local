@@ -1,0 +1,250 @@
+name: Assemble verified installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Unpublished stable release tag
+        required: true
+        type: string
+      manifest_asset:
+        description: Name of the uploaded installer parts manifest
+        required: true
+        type: string
+      expected_sha256:
+        description: SHA-256 of the locally verified Transkript.dmg
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: transkript-installer-assembly-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  assemble-installer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Verify uploaded parts and assemble Transkript.dmg
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          MANIFEST_ASSET: ${{ inputs.manifest_asset }}
+          EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from concurrent.futures import ThreadPoolExecutor
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import tempfile
+          from urllib.parse import urlsplit
+
+          REPOSITORY = "lucaszrezende/legendas-video-local"
+          PRIMARY = "Transkript.dmg"
+          ALIAS = "WhisperPRO.dmg"
+          PART_SIZE = 2 * 1024 * 1024
+          SMALL_LIMITS = {"version.json": 64 * 1024, "SHA256SUMS.txt": 8 * 1024}
+          tag = os.environ.get("RELEASE_TAG", "")
+          manifest_name = os.environ.get("MANIFEST_ASSET", "")
+          expected = os.environ.get("EXPECTED_SHA256", "")
+          child_env = os.environ.copy()
+          child_env.pop("GH_DEBUG", None)
+
+          def require(condition, message):
+              if not condition:
+                  raise ValueError(message)
+
+          def command(*args, output=None):
+              result = subprocess.run(args, env=child_env, stdout=output or subprocess.PIPE,
+                                      stderr=subprocess.PIPE, text=output is None)
+              if result.returncode:
+                  # Never echo credentials, headers, or arbitrary remote bodies.
+                  raise RuntimeError(f"GitHub CLI failed (exit {result.returncode}); draft kept unpublished.")
+              return result.stdout
+
+          def api(endpoint):
+              return json.loads(command("gh", "api", endpoint))
+
+          def read_draft(release_id=None):
+              if release_id is None:
+                  identity = json.loads(command("gh", "release", "view", tag, "--repo", REPOSITORY,
+                                                "--json", "databaseId"))
+                  release_id = identity.get("databaseId")
+                  require(type(release_id) is int and release_id > 0, "Draft release ID is invalid.")
+              release = api(f"repos/{REPOSITORY}/releases/{release_id}")
+              require(release.get("tag_name") == tag and release.get("id") == release_id,
+                      "Release tag or identity changed.")
+              require(release.get("draft") is True and release.get("prerelease") is False,
+                      "Only an unpublished stable draft may be assembled.")
+              return release
+
+          def assets(release_id):
+              found = {}
+              page = 1
+              while True:
+                  batch = api(f"repos/{REPOSITORY}/releases/{release_id}/assets?per_page=100&page={page}")
+                  require(isinstance(batch, list), "Release asset response is invalid.")
+                  for entry in batch:
+                      require(isinstance(entry, dict), "Release asset metadata is invalid.")
+                      name = entry.get("name")
+                      require(isinstance(name, str) and name not in found, "Duplicate or invalid asset name.")
+                      require(entry.get("state") == "uploaded",
+                              f"Unfinished asset {name!r} remains; inspect the owned draft before retrying.")
+                      found[name] = entry
+                  if len(batch) < 100:
+                      return found
+                  page += 1
+
+          def uploaded(asset, name, size=None, digest=None):
+              require(isinstance(asset, dict), f"Required asset is missing: {name}.")
+              require(asset.get("name") == name and asset.get("state") == "uploaded", f"Asset is incomplete: {name}.")
+              require(type(asset.get("id")) is int and asset["id"] > 0, f"Asset ID is invalid: {name}.")
+              require(type(asset.get("size")) is int and asset["size"] > 0, f"Asset size is invalid: {name}.")
+              require(isinstance(asset.get("digest"), str)
+                      and re.fullmatch(r"sha256:[0-9a-f]{64}", asset["digest"]) is not None,
+                      f"Remote SHA-256 is unavailable: {name}.")
+              if size is not None:
+                  require(asset["size"] == size, f"Remote size mismatch: {name}.")
+              if digest is not None:
+                  require(asset["digest"] == "sha256:" + digest, f"Remote digest mismatch: {name}.")
+              return asset
+
+          def sha256(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as source:
+                  for block in iter(lambda: source.read(1024 * 1024), b""):
+                      digest.update(block)
+              return digest.hexdigest()
+
+          def unique_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  require(key not in result, "Duplicate JSON key.")
+                  result[key] = value
+              return result
+
+          def read_json(path):
+              return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object,
+                                parse_constant=lambda value: (_ for _ in ()).throw(ValueError("Non-finite JSON value.")))
+
+          def download(name, directory, metadata):
+              path = directory / name
+              with path.open("xb") as destination:
+                  # Resolve by immutable asset ID, including unpublished drafts;
+                  # stream authenticated binary responses directly to disk.
+                  command("gh", "api", f"repos/{REPOSITORY}/releases/assets/{metadata['id']}",
+                          "--header", "Accept: application/octet-stream", output=destination)
+              require(path.stat().st_size == metadata["size"], f"Downloaded size mismatch: {name}.")
+              require(metadata["digest"] == "sha256:" + sha256(path), f"Downloaded digest mismatch: {name}.")
+              return path
+
+          def validate_manifest(manifest):
+              require(isinstance(manifest, dict) and set(manifest) == {"version", "tag", "filename", "size", "sha256", "parts"},
+                      "Parts manifest schema is invalid.")
+              require(type(manifest["version"]) is int and manifest["version"] == 1, "Unsupported manifest version.")
+              require(manifest["tag"] == tag and manifest["filename"] == PRIMARY and manifest["sha256"] == expected,
+                      "Parts manifest does not identify the expected installer.")
+              total = manifest["size"]
+              require(type(total) is int and 0 < total <= 2 * 1024 * 1024 * 1024, "Installer size is invalid.")
+              parts = manifest["parts"]
+              require(isinstance(parts, list) and 1 <= len(parts) <= 900
+                      and len(parts) == (total + PART_SIZE - 1) // PART_SIZE,
+                      "Manifest part count is invalid.")
+              for index, part in enumerate(parts):
+                  require(isinstance(part, dict) and set(part) == {"name", "size", "sha256"}, "Part schema is invalid.")
+                  require(part["name"] == f"transkript-upload-{tag}-part-{index:03}.bin", "Part names or order are invalid.")
+                  require(type(part["size"]) is int and part["size"] == min(PART_SIZE, total - index * PART_SIZE),
+                          "Part size is invalid.")
+                  require(isinstance(part["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", part["sha256"]) is not None,
+                          "Part SHA-256 is invalid.")
+              return total, parts
+
+          def validate_feed(feed, checksums_path):
+              require(isinstance(feed, dict), "version.json must contain an object.")
+              require(feed.get("version") == tag[1:], "Feed version does not match release tag.")
+              require(type(feed.get("build")) is int and feed["build"] > 0, "Feed build must be a positive integer.")
+              require(feed.get("sha256") == expected, "Feed SHA-256 does not match installer.")
+              require(feed.get("notes") is None or isinstance(feed["notes"], str), "Feed notes must be text or null.")
+              require(isinstance(feed.get("url"), str), "Feed download URL is invalid.")
+              url = urlsplit(feed["url"])
+              prefix = f"/{REPOSITORY}/releases/download/{tag}/"
+              require(url.scheme == "https" and url.netloc == "github.com" and not url.query and not url.fragment
+                      and url.path in (prefix + PRIMARY, prefix + ALIAS), "Feed URL does not belong to this release.")
+              checksums = {}
+              for line in checksums_path.read_text(encoding="utf-8").splitlines():
+                  match = re.fullmatch(r"([0-9a-f]{64}) [ *](Transkript\.dmg|WhisperPRO\.dmg)", line)
+                  require(match is not None and match[2] not in checksums, "Checksum file is malformed or contains duplicates.")
+                  checksums[match[2]] = match[1]
+              require(checksums == {PRIMARY: expected, ALIAS: expected}, "Checksums do not match both installer names.")
+
+          def same_assets(before, after, extra_names=()):
+              require(set(after) == set(before) | set(extra_names), "Release asset inventory changed during verification.")
+              for name, metadata in before.items():
+                  require(all(metadata.get(key) == after[name].get(key)
+                          for key in ("id", "name", "state", "size", "digest", "updated_at")),
+                          f"Asset changed during verification: {name}.")
+
+          def main():
+              require(os.environ.get("GITHUB_REPOSITORY") == REPOSITORY, "Unexpected repository.")
+              require(re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", tag) is not None,
+                      "Tag must be a stable semantic version such as v0.15.4.")
+              require(manifest_name == f"transkript-upload-{tag}-manifest.json", "Unexpected manifest asset name.")
+              require(re.fullmatch(r"[0-9a-f]{64}", expected) is not None, "Expected SHA-256 must be 64 lowercase hexadecimal characters.")
+              release_id = read_draft()["id"]
+              initial = assets(release_id)
+              manifest_meta = uploaded(initial.get(manifest_name), manifest_name)
+              require(manifest_meta["size"] <= 256 * 1024, "Parts manifest exceeds its size limit.")
+              for name, limit in SMALL_LIMITS.items():
+                  require(uploaded(initial.get(name), name)["size"] <= limit, f"Asset exceeds the allowed size: {name}.")
+              with tempfile.TemporaryDirectory(prefix="transkript-installer-assembly-") as folder:
+                  directory = Path(folder)
+                  manifest = read_json(download(manifest_name, directory, manifest_meta))
+                  total, parts = validate_manifest(manifest)
+                  for part in parts:
+                      uploaded(initial.get(part["name"]), part["name"], part["size"], part["sha256"])
+                  feed = read_json(download("version.json", directory, initial["version.json"]))
+                  checksums_path = download("SHA256SUMS.txt", directory, initial["SHA256SUMS.txt"])
+                  validate_feed(feed, checksums_path)
+                  if ALIAS in initial:
+                      uploaded(initial[ALIAS], ALIAS, total, expected)
+                  if PRIMARY in initial:
+                      uploaded(initial[PRIMARY], PRIMARY, total, expected)
+                      read_draft(release_id)
+                      same_assets(initial, assets(release_id))
+                      print("Transkript.dmg is already uploaded with the verified size and SHA-256; nothing overwritten.")
+                      return
+                  with ThreadPoolExecutor(max_workers=4) as executor:
+                      # list preserves manifest order and propagates every worker failure.
+                      paths = list(executor.map(lambda part: download(part["name"], directory, initial[part["name"]]), parts))
+                  primary = directory / PRIMARY
+                  with primary.open("xb") as destination:
+                      for path in paths:
+                          with path.open("rb") as source:
+                              for block in iter(lambda: source.read(1024 * 1024), b""):
+                                  destination.write(block)
+                  require(primary.stat().st_size == total and sha256(primary) == expected,
+                          "Assembled installer does not match the locally verified size and SHA-256.")
+                  read_draft(release_id)
+                  same_assets(initial, assets(release_id))
+                  print(f"Verified {len(parts)} parts, {total} bytes and build {feed['build']}; uploading assembled installer.")
+                  command("gh", "release", "upload", tag, "--repo", REPOSITORY, str(primary))
+                  read_draft(release_id)
+                  final = assets(release_id)
+                  same_assets(initial, final, (PRIMARY,))
+                  uploaded(final.get(PRIMARY), PRIMARY, total, expected)
+                  print(f"Installer verified: SHA-256 {expected}. Parts retained and draft remains unpublished.")
+
+          try:
+              main()
+          except (ValueError, RuntimeError, OSError, json.JSONDecodeError) as error:
+              raise SystemExit(f"Assembly refused: {error}") from None
+          PY
