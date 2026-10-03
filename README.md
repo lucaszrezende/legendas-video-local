@@ -4,7 +4,7 @@ Transcrição de áudio e vídeo no Mac, com Whisper Large V3, edição por fras
 identificação de falantes, análise de voz e refinamento opcional com IA local.
 Anteriormente chamado **Whisper PRO** e **Legendas Vídeo Local**.
 
-A versão atual é **0.15.2 (build 21)**. Este repositório hospeda os instaladores,
+A versão atual é **0.15.3 (build 22)**. Este repositório hospeda os instaladores,
 o feed de atualização e as ferramentas de publicação; o código-fonte do
 aplicativo não é publicado aqui.
 
@@ -27,8 +27,26 @@ Na primeira abertura, pode ser necessário autorizar o aplicativo em
 
 - Interface com fila de arquivos, histórico, busca, atalhos e modo foco.
 - Estimativa do número de falantes e indicação de quem fala cada frase.
+- Modelo de falantes com o mesmo fluxo dos modelos de transcrição: baixar,
+  acompanhar o progresso e usar.
 - Edição de texto e exportação SRT, VTT, TXT e JSON.
 - Popup automático de atualização, notas da versão e acesso ao instalador.
+
+## Identificação de falantes
+
+Em **Modelos → Identificação de falantes**, o cartão **Community-1** mostra
+o tamanho do modelo e o botão **Baixar**. Durante o download, acompanhe o
+percentual ou use **Cancelar**. Se houver uma falha, o cartão oferece
+**Tentar de novo**.
+
+Depois de instalado, o cartão mostra **Em uso** quando **Identificar falantes**
+está ativado. Se você desativou o recurso, o botão **Usar** permite ativá-lo
+novamente. Baixar o modelo preserva sua escolha de ativar ou desativar;
+a preferência vale para as próximas transcrições. As vozes são comparadas
+localmente para estimar quantas pessoas falam e marcar o falante de cada frase.
+
+O menu **⋯** reúne **Abrir pasta** e **Apagar do disco**. Aguarde uma transcrição
+em andamento terminar antes de alterar esses controles ou apagar o modelo.
 
 ## Atualizações
 
