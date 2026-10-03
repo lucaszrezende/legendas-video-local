@@ -1,7 +1,7 @@
 {
-  "version": "0.15.3",
-  "build": 22,
-  "url": "https://github.com/lucaszrezende/legendas-video-local/releases/download/v0.15.3/Transkript.dmg",
-  "notes": "A identificação de falantes agora tem um seletor prático em **Modelos**, seguindo o mesmo padrão dos modelos de transcrição.\n\n- Cartão Community-1 com tamanho, **Baixar**, progresso, **Cancelar**, **Tentar de novo**, **Usar** e **Em uso**.\n- Opção **Identificar falantes** em Modelos e antes de transcrever. Ao desligar, o app transcreve sem executar a análise de vozes; a preferência permanece ao reabrir.\n- Download manual ou automático no primeiro uso, com cache compartilhado e retomada sem apagar pesos válidos. O acesso à pasta fica no menu secundário.\n- O cartão reconhece o modelo baixado automaticamente depois que a transcrição termina.\n- Ao cancelar uma análise e iniciar outra, a próxima aguarda a limpeza da anterior.\n\nA atualização mantém o popup automático, o feed compatível com Whisper PRO e os dados e modelos já instalados.",
-  "sha256": "5783d0ce23bcead19b6481067958b2ffe164522ed9501c5de6f85281d5ba6da3"
+  "version": "0.15.4",
+  "build": 23,
+  "url": "https://github.com/lucaszrezende/legendas-video-local/releases/download/v0.15.4/Transkript.dmg",
+  "notes": "## Idioma do aplicativo\n\n- Novo seletor em Ajustes → Idioma do aplicativo.\n- Português (Brasil) é o idioma principal e o padrão da interface.\n- Também disponíveis: inglês, espanhol, francês, alemão, italiano, chinês simplificado e japonês.\n- Traduções das telas, modelos, mensagens e rótulos dos falantes.\n- A troca atualiza a interface imediatamente e fica salva para a próxima abertura. Alguns menus e controles nativos do macOS acompanham a escolha ao reabrir o aplicativo.\n- O idioma da interface é independente do idioma da transcrição. Texto, fila, seleção e identificação dos falantes são preservados ao trocar.\n\nO seletor prático de modelos de falantes e os avisos de atualização continuam disponíveis.\n\nmacOS 26 ou posterior, Apple Silicon. Os instaladores Transkript.dmg e WhisperPRO.dmg têm o mesmo conteúdo; o segundo nome mantém a compatibilidade com instalações anteriores.",
+  "sha256": "4be4e69a88d9e8bb10bfd559579bdd0dfeddf53c7eb81f3d5bb944745a9dc351"
 }
