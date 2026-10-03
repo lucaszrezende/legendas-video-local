@@ -44,4 +44,12 @@ Quando a conexão local não conclui o envio de um DMG inteiro, **Assemble verif
 
 A composição não sobrescreve arquivos, não remove assets e não publica releases. Um `Transkript.dmg` completo já existente com tamanho e hash corretos é preservado; qualquer divergência interrompe a ação. Os arquivos enviados são partes do instalador distribuível, sem código-fonte do aplicativo.
 
+## Reconstrução opcional por delta
+
+**Restore verified installer delta** reduz o envio local reutilizando o instalador publicado em `v0.15.3`. Exige um delta validado localmente que reconstrua o DMG completo byte por byte, incluindo o rodapé da imagem. A conversão ocorre no macOS e só termina se os hashes do instalador base, das imagens intermediárias e do instalador final coincidirem. O aplicativo não é executado.
+
+Envie o ZIP do delta em partes de 2 MiB com nomes `transkript-upload-<tag>-delta-part-000.bin` e seguintes. O manifesto de transporte `transkript-upload-<tag>-delta-manifest.json` usa o formato da seção anterior, com `filename` igual a `transkript-upload-<tag>-delta.zip`. Informe no workflow a `tag`, o `expected_installer_sha256` do DMG completo e o `expected_delta_sha256` do ZIP. A ação cria somente `Transkript.dmg` em um rascunho; não sobrescreve, remove ou publica arquivos.
+
+Depois do sucesso, execute o espelhamento, confira os dois instaladores e remova apenas as partes e os manifestos de transporte dessa operação. Preserve `version.json` e `SHA256SUMS.txt`. Publique somente com os arquivos finais completos e aguarde **Update feed**.
+
 Verificações locais das ferramentas: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools -p 'test_release_feed.py'`.

@@ -4,7 +4,7 @@ Transcrição de áudio e vídeo no Mac, com Whisper Large V3, edição por fras
 identificação de falantes, análise de voz e refinamento opcional com IA local.
 Anteriormente chamado **Whisper PRO** e **Legendas Vídeo Local**.
 
-A versão atual é **0.15.3 (build 22)**. Este repositório hospeda os instaladores,
+A versão atual é **0.15.4 (build 23)**. Este repositório hospeda os instaladores,
 o feed de atualização e as ferramentas de publicação; o código-fonte do
 aplicativo não é publicado aqui.
 
@@ -26,11 +26,24 @@ Na primeira abertura, pode ser necessário autorizar o aplicativo em
 ## O que mudou
 
 - Interface com fila de arquivos, histórico, busca, atalhos e modo foco.
+- Idioma do aplicativo configurável, com português brasileiro como padrão e
+  mais sete idiomas disponíveis.
 - Estimativa do número de falantes e indicação de quem fala cada frase.
 - Modelo de falantes com o mesmo fluxo dos modelos de transcrição: baixar,
   acompanhar o progresso e usar.
 - Edição de texto e exportação SRT, VTT, TXT e JSON.
 - Popup automático de atualização, notas da versão e acesso ao instalador.
+
+## Idioma do aplicativo
+
+Em **Ajustes → Idioma do aplicativo**, escolha **Português (Brasil)**, English,
+Español, Français, Deutsch, Italiano, 简体中文 ou 日本語. O português brasileiro
+é o padrão da interface; a escolha fica salva e os textos do app mudam
+imediatamente. Alguns menus e controles nativos do macOS acompanham a escolha
+ao reabrir o aplicativo.
+
+O idioma da interface é independente do idioma usado para transcrever o áudio.
+Trocar a interface preserva o texto, os falantes, a fila e a seleção atual.
 
 ## Identificação de falantes
 
