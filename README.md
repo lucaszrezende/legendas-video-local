@@ -4,7 +4,7 @@ Transcrição de áudio e vídeo no Mac, com Whisper Large V3, edição por fras
 identificação de falantes, análise de voz e refinamento opcional com IA local.
 Anteriormente chamado **Whisper PRO** e **Legendas Vídeo Local**.
 
-A versão atual é **0.15.1 (build 20)**. Este repositório hospeda os instaladores,
+A versão atual é **0.15.2 (build 21)**. Este repositório hospeda os instaladores,
 o feed de atualização e as ferramentas de publicação; o código-fonte do
 aplicativo não é publicado aqui.
 
@@ -28,16 +28,27 @@ Na primeira abertura, pode ser necessário autorizar o aplicativo em
 - Interface com fila de arquivos, histórico, busca, atalhos e modo foco.
 - Estimativa do número de falantes e indicação de quem fala cada frase.
 - Edição de texto e exportação SRT, VTT, TXT e JSON.
-- Aviso de atualização com notas da versão e acesso ao instalador.
+- Popup automático de atualização, notas da versão e acesso ao instalador.
 
 ## Atualizações
 
-O Transkript 0.15.1 verifica novas versões ao abrir, ao retornar ao app e
-uma vez por hora de uso ativo. O aviso confirmado permanece disponível ao
-reabrir ou quando a conexão falha. A opção **Avisar quando houver versão nova**
-fica em Ajustes; **Verificar agora** permite consultar a qualquer momento.
-O download abre no navegador e a instalação é feita pelo usuário. O aviso
-aparece dentro do aplicativo enquanto ele está aberto.
+A partir do **Transkript 0.15.2**, uma versão com build superior ao instalado
+abre automaticamente um popup nativo com **Baixar atualização** e **Mais tarde**.
+O aviso aguarda o aplicativo ficar ativo e uma transcrição, importação ou outro
+diálogo terminar. Ele aparece uma vez por versão em cada execução; ao escolher
+**Mais tarde**, pode aparecer novamente na próxima abertura, enquanto houver
+uma atualização disponível. Se você já usa a última versão, o popup não aparece.
+
+Com **Avisar quando houver versão nova** ativado em Ajustes, cada abertura faz
+uma consulta nova ao feed, mesmo que a consulta anterior seja recente. O app
+também verifica ao retornar ao primeiro plano e uma vez por hora de uso ativo,
+respeitando o intervalo de uma hora entre essas consultas. O aviso confirmado
+permanece disponível ao reabrir ou quando a conexão falha; **Verificar agora**
+permite consultar a qualquer momento. O download abre no navegador e a
+instalação é feita pelo usuário.
+
+Versões anteriores conservam os avisos dentro do aplicativo, na barra lateral
+ou no banner, e recebem o popup nativo depois de atualizar para a 0.15.2.
 
 O endereço usado pelo **Whisper PRO 0.13** voltou a funcionar e aponta para
 o mesmo feed. Essa versão conserva o intervalo original de 23 horas entre
