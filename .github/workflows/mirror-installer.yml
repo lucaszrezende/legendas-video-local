@@ -1,0 +1,217 @@
+name: Mirror compatible installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Draft release tag to mirror
+        required: true
+        type: string
+      expected_sha256:
+        description: SHA-256 of the locally verified Transkript.dmg
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: transkript-installer-mirror-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  mirror-installer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Verify draft assets and mirror WhisperPRO.dmg
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import subprocess
+          import tempfile
+          from urllib.parse import urlsplit
+
+          REPOSITORY = "lucaszrezende/legendas-video-local"
+          PRIMARY = "Transkript.dmg"
+          ALIAS = "WhisperPRO.dmg"
+          SMALL_LIMITS = {"version.json": 64 * 1024, "SHA256SUMS.txt": 8 * 1024}
+          tag = os.environ.get("RELEASE_TAG", "")
+          expected = os.environ.get("EXPECTED_SHA256", "")
+          child_env = os.environ.copy()
+          child_env.pop("GH_DEBUG", None)
+
+          def require(condition, message):
+              if not condition:
+                  raise ValueError(message)
+
+          def command(*args):
+              result = subprocess.run(args, env=child_env, capture_output=True, text=True)
+              if result.returncode:
+                  # Do not echo environment, API headers, or arbitrary remote bodies.
+                  raise RuntimeError(f"GitHub CLI failed (exit {result.returncode}); draft kept unpublished.")
+              return result.stdout
+
+          def api(endpoint):
+              return json.loads(command("gh", "api", endpoint))
+
+          def read_draft(release_id=None):
+              if release_id is None:
+                  # A draft's tag may not exist as a Git ref yet. gh resolves
+                  # unpublished drafts, unlike the published-by-tag REST lookup.
+                  identity = json.loads(command("gh", "release", "view", tag, "--repo", REPOSITORY,
+                                                "--json", "databaseId"))
+                  release_id = identity.get("databaseId")
+                  require(type(release_id) is int and release_id > 0, "Draft release ID is invalid.")
+              release = api(f"repos/{REPOSITORY}/releases/{release_id}")
+              require(release.get("tag_name") == tag, "Release tag changed.")
+              require(release.get("draft") is True and release.get("prerelease") is False,
+                      "Only an unpublished stable draft may be mirrored.")
+              require(type(release.get("id")) is int and release["id"] > 0, "Release ID is invalid.")
+              require(release["id"] == release_id, "Release identity changed.")
+              return release
+
+          def assets(release_id):
+              # This endpoint includes unfinished 'starter' assets that gh release
+              # view may omit. Never delete or overwrite them automatically.
+              found = {}
+              page = 1
+              while True:
+                  batch = api(f"repos/{REPOSITORY}/releases/{release_id}/assets?per_page=100&page={page}")
+                  require(isinstance(batch, list), "Release asset response is invalid.")
+                  for entry in batch:
+                      name = entry.get("name")
+                      require(isinstance(name, str) and name not in found, "Duplicate or invalid asset name.")
+                      found[name] = entry
+                  if len(batch) < 100:
+                      for name, metadata in found.items():
+                          require(metadata.get("state") == "uploaded",
+                                  f"Unfinished asset {name!r} remains; wait for its uploader or inspect owned-draft cleanup manually.")
+                      return found
+                  page += 1
+
+          def uploaded(asset, name):
+              require(asset is not None, f"Required asset is missing: {name}.")
+              require(asset.get("state") == "uploaded",
+                      f"Asset {name} is incomplete (possibly starter); inspect and clean the owned draft manually.")
+              require(type(asset.get("size")) is int and asset["size"] > 0, f"Asset size is invalid: {name}.")
+              require(type(asset.get("id")) is int and asset["id"] > 0, f"Asset ID is invalid: {name}.")
+              return asset
+
+          def sha256(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as source:
+                  for block in iter(lambda: source.read(1024 * 1024), b""):
+                      digest.update(block)
+              return digest.hexdigest()
+
+          def installer(asset, name, size=None):
+              uploaded(asset, name)
+              require(asset.get("digest") == "sha256:" + expected, f"Remote digest mismatch: {name}.")
+              if size is not None:
+                  require(asset["size"] == size, f"Remote size mismatch: {name}.")
+              return asset
+
+          def same_asset(before, after, name):
+              require(after is not None and all(before.get(key) == after.get(key)
+                      for key in ("id", "name", "state", "size", "digest", "updated_at")),
+                      f"Asset changed during verification: {name}.")
+
+          def unique_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  require(key not in result, "Duplicate key in version.json.")
+                  result[key] = value
+              return result
+
+          def download(name, directory, metadata):
+              command("gh", "release", "download", tag, "--repo", REPOSITORY,
+                      "--pattern", name, "--dir", str(directory))
+              path = directory / name
+              require(path.is_file() and path.stat().st_size == metadata["size"],
+                      f"Downloaded size mismatch: {name}.")
+              if metadata.get("digest") is not None:
+                  require(metadata["digest"] == "sha256:" + sha256(path), f"Downloaded digest mismatch: {name}.")
+              return path
+
+          def main():
+              require(os.environ.get("GITHUB_REPOSITORY") == REPOSITORY, "Unexpected repository.")
+              require(re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", tag) is not None,
+                      "Tag must be a stable semantic version such as v0.15.4.")
+              require(re.fullmatch(r"[0-9a-f]{64}", expected) is not None, "Expected SHA-256 must be 64 lowercase hexadecimal characters.")
+              release = read_draft()
+              release_id = release["id"]
+              initial = assets(release_id)
+              primary_meta = installer(initial.get(PRIMARY), PRIMARY)
+              for name, limit in SMALL_LIMITS.items():
+                  metadata = uploaded(initial.get(name), name)
+                  require(metadata["size"] <= limit, f"Asset exceeds the allowed size: {name}.")
+              existing_alias = initial.get(ALIAS)
+              if existing_alias is not None:
+                  installer(existing_alias, ALIAS, primary_meta["size"])
+
+              with tempfile.TemporaryDirectory(prefix="transkript-installer-mirror-") as folder:
+                  directory = Path(folder)
+                  primary = download(PRIMARY, directory, primary_meta)
+                  require(sha256(primary) == expected, "Installer does not match the locally verified SHA-256.")
+                  manifest_path = download("version.json", directory, initial["version.json"])
+                  checksums_path = download("SHA256SUMS.txt", directory, initial["SHA256SUMS.txt"])
+                  feed = json.loads(manifest_path.read_text(encoding="utf-8"), object_pairs_hook=unique_object,
+                                    parse_constant=lambda value: (_ for _ in ()).throw(ValueError("Non-finite JSON value.")))
+                  require(isinstance(feed, dict), "version.json must contain an object.")
+                  require(feed.get("version") == tag[1:], "Manifest version does not match release tag.")
+                  require(type(feed.get("build")) is int and feed["build"] > 0, "Manifest build must be a positive integer.")
+                  require(feed.get("sha256") == expected, "Manifest SHA-256 does not match installer.")
+                  require(feed.get("notes") is None or isinstance(feed["notes"], str), "Manifest notes must be text or null.")
+                  require(isinstance(feed.get("url"), str), "Manifest download URL is invalid.")
+                  url = urlsplit(feed["url"])
+                  prefix = f"/{REPOSITORY}/releases/download/{tag}/"
+                  require(url.scheme == "https" and url.netloc == "github.com" and not url.query and not url.fragment
+                          and url.path in (prefix + PRIMARY, prefix + ALIAS), "Manifest URL does not belong to this release.")
+                  checksums = {}
+                  for line in checksums_path.read_text(encoding="utf-8").splitlines():
+                      match = re.fullmatch(r"([0-9a-f]{64}) [ *](Transkript\.dmg|WhisperPRO\.dmg)", line)
+                      require(match is not None and match[2] not in checksums, "Checksum file is malformed or contains duplicates.")
+                      checksums[match[2]] = match[1]
+                  require(checksums == {PRIMARY: expected, ALIAS: expected}, "Checksums do not match both installer names.")
+
+                  read_draft(release_id)
+                  before_upload = assets(release_id)
+                  for name in (PRIMARY, "version.json", "SHA256SUMS.txt"):
+                      same_asset(initial[name], before_upload.get(name), name)
+                  if existing_alias is not None:
+                      same_asset(existing_alias, before_upload.get(ALIAS), ALIAS)
+                      print("WhisperPRO.dmg is already uploaded with the expected digest and size; nothing overwritten.")
+                  else:
+                      require(ALIAS not in before_upload, "Alias appeared during verification; rerun to inspect it without overwriting.")
+                      alias = directory / ALIAS
+                      try:
+                          os.link(primary, alias)
+                      except OSError:
+                          shutil.copyfile(primary, alias)
+                      print(f"Verified {tag}, build {feed['build']}, {primary_meta['size']} bytes; uploading compatible alias.")
+                      command("gh", "release", "upload", tag, "--repo", REPOSITORY, str(alias))
+
+                  read_draft(release_id)
+                  final = assets(release_id)
+                  for name in (PRIMARY, "version.json", "SHA256SUMS.txt"):
+                      same_asset(initial[name], final.get(name), name)
+                  installer(final.get(ALIAS), ALIAS, primary_meta["size"])
+                  print(f"Mirror verified: both installer names have SHA-256 {expected}. Draft remains unpublished.")
+
+          try:
+              main()
+          except (ValueError, RuntimeError, OSError, json.JSONDecodeError) as error:
+              raise SystemExit(f"Mirror refused: {error}") from None
+          PY
