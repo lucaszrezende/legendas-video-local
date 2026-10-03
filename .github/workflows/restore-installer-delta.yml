@@ -1,0 +1,372 @@
+name: Restore verified installer delta
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Unpublished stable release tag
+        required: true
+        type: string
+      expected_installer_sha256:
+        description: SHA-256 of the locally verified complete Transkript.dmg
+        required: true
+        type: string
+      expected_delta_sha256:
+        description: SHA-256 of the locally verified installer delta ZIP
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: transkript-installer-delta-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  restore-installer:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Verify delta parts and restore the exact Transkript.dmg
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          EXPECTED_INSTALLER_SHA256: ${{ inputs.expected_installer_sha256 }}
+          EXPECTED_DELTA_SHA256: ${{ inputs.expected_delta_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from concurrent.futures import ThreadPoolExecutor
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import tempfile
+          import stat
+          import zipfile
+          from urllib.parse import urlsplit
+
+          REPOSITORY = "lucaszrezende/legendas-video-local"
+          PRIMARY = "Transkript.dmg"
+          ALIAS = "WhisperPRO.dmg"
+          PART_SIZE = 2 * 1024 * 1024
+          SMALL_LIMITS = {"version.json": 64 * 1024, "SHA256SUMS.txt": 8 * 1024}
+          tag = os.environ.get("RELEASE_TAG", "")
+          manifest_name = f"transkript-upload-{tag}-delta-manifest.json"
+          expected = os.environ.get("EXPECTED_INSTALLER_SHA256", "")
+          delta_expected = os.environ.get("EXPECTED_DELTA_SHA256", "")
+          BASE_TAG = "v0.15.3"
+          MAX_BYTES = 1024 * 1024 * 1024
+          child_env = os.environ.copy()
+          child_env.pop("GH_DEBUG", None)
+
+          def require(condition, message):
+              if not condition:
+                  raise ValueError(message)
+
+          def command(*args, output=None):
+              result = subprocess.run(args, env=child_env, stdout=output or subprocess.PIPE,
+                                      stderr=subprocess.PIPE, text=output is None)
+              if result.returncode:
+                  # Never echo credentials, headers, or arbitrary remote bodies.
+                  raise RuntimeError(f"GitHub CLI failed (exit {result.returncode}); draft kept unpublished.")
+              return result.stdout
+
+          def api(endpoint):
+              return json.loads(command("gh", "api", endpoint))
+
+          def read_draft(release_id=None):
+              if release_id is None:
+                  identity = json.loads(command("gh", "release", "view", tag, "--repo", REPOSITORY,
+                                                "--json", "databaseId"))
+                  release_id = identity.get("databaseId")
+                  require(type(release_id) is int and release_id > 0, "Draft release ID is invalid.")
+              release = api(f"repos/{REPOSITORY}/releases/{release_id}")
+              require(release.get("tag_name") == tag and release.get("id") == release_id,
+                      "Release tag or identity changed.")
+              require(release.get("draft") is True and release.get("prerelease") is False,
+                      "Only an unpublished stable draft may be assembled.")
+              return release
+
+          def assets(release_id):
+              found = {}
+              page = 1
+              while True:
+                  batch = api(f"repos/{REPOSITORY}/releases/{release_id}/assets?per_page=100&page={page}")
+                  require(isinstance(batch, list), "Release asset response is invalid.")
+                  for entry in batch:
+                      require(isinstance(entry, dict), "Release asset metadata is invalid.")
+                      name = entry.get("name")
+                      require(isinstance(name, str) and name not in found, "Duplicate or invalid asset name.")
+                      require(entry.get("state") == "uploaded",
+                              f"Unfinished asset {name!r} remains; inspect the owned draft before retrying.")
+                      found[name] = entry
+                  if len(batch) < 100:
+                      return found
+                  page += 1
+
+          def uploaded(asset, name, size=None, digest=None):
+              require(isinstance(asset, dict), f"Required asset is missing: {name}.")
+              require(asset.get("name") == name and asset.get("state") == "uploaded", f"Asset is incomplete: {name}.")
+              require(type(asset.get("id")) is int and asset["id"] > 0, f"Asset ID is invalid: {name}.")
+              require(type(asset.get("size")) is int and asset["size"] > 0, f"Asset size is invalid: {name}.")
+              require(isinstance(asset.get("digest"), str)
+                      and re.fullmatch(r"sha256:[0-9a-f]{64}", asset["digest"]) is not None,
+                      f"Remote SHA-256 is unavailable: {name}.")
+              if size is not None:
+                  require(asset["size"] == size, f"Remote size mismatch: {name}.")
+              if digest is not None:
+                  require(asset["digest"] == "sha256:" + digest, f"Remote digest mismatch: {name}.")
+              return asset
+
+          def sha256(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as source:
+                  for block in iter(lambda: source.read(1024 * 1024), b""):
+                      digest.update(block)
+              return digest.hexdigest()
+
+          def unique_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  require(key not in result, "Duplicate JSON key.")
+                  result[key] = value
+              return result
+
+          def read_json(path):
+              return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object,
+                                parse_constant=lambda value: (_ for _ in ()).throw(ValueError("Non-finite JSON value.")))
+
+          def download(name, directory, metadata):
+              path = directory / name
+              with path.open("xb") as destination:
+                  # Resolve by immutable asset ID, including unpublished drafts;
+                  # stream authenticated binary responses directly to disk.
+                  command("gh", "api", f"repos/{REPOSITORY}/releases/assets/{metadata['id']}",
+                          "--header", "Accept: application/octet-stream", output=destination)
+              require(path.stat().st_size == metadata["size"], f"Downloaded size mismatch: {name}.")
+              require(metadata["digest"] == "sha256:" + sha256(path), f"Downloaded digest mismatch: {name}.")
+              return path
+
+          def validate_feed(feed, checksums_path):
+              require(isinstance(feed, dict), "version.json must contain an object.")
+              require(feed.get("version") == tag[1:], "Feed version does not match release tag.")
+              require(type(feed.get("build")) is int and feed["build"] > 0, "Feed build must be a positive integer.")
+              require(feed.get("sha256") == expected, "Feed SHA-256 does not match installer.")
+              require(feed.get("notes") is None or isinstance(feed["notes"], str), "Feed notes must be text or null.")
+              require(isinstance(feed.get("url"), str), "Feed download URL is invalid.")
+              url = urlsplit(feed["url"])
+              prefix = f"/{REPOSITORY}/releases/download/{tag}/"
+              require(url.scheme == "https" and url.netloc == "github.com" and not url.query and not url.fragment
+                      and url.path in (prefix + PRIMARY, prefix + ALIAS), "Feed URL does not belong to this release.")
+              checksums = {}
+              for line in checksums_path.read_text(encoding="utf-8").splitlines():
+                  match = re.fullmatch(r"([0-9a-f]{64}) [ *](Transkript\.dmg|WhisperPRO\.dmg)", line)
+                  require(match is not None and match[2] not in checksums, "Checksum file is malformed or contains duplicates.")
+                  checksums[match[2]] = match[1]
+              require(checksums == {PRIMARY: expected, ALIAS: expected}, "Checksums do not match both installer names.")
+
+          def same_assets(before, after, extra_names=()):
+              require(set(after) == set(before) | set(extra_names), "Release asset inventory changed during verification.")
+              for name, metadata in before.items():
+                  require(all(metadata.get(key) == after[name].get(key)
+                          for key in ("id", "name", "state", "size", "digest", "updated_at")),
+                          f"Asset changed during verification: {name}.")
+
+
+          def positive_size(value, name, limit=MAX_BYTES):
+              require(type(value) is int and 0 < value <= limit, f"Invalid {name}.")
+              return value
+
+          def digest_value(value, name):
+              require(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None,
+                      f"Invalid {name}.")
+              return value
+
+          def validate_transport(manifest):
+              require(isinstance(manifest, dict) and set(manifest) == {"version", "tag", "filename", "size", "sha256", "parts"},
+                      "Delta transport manifest schema is invalid.")
+              require(type(manifest["version"]) is int and manifest["version"] == 1, "Unsupported transport version.")
+              require(manifest["tag"] == tag and manifest["filename"] == f"transkript-upload-{tag}-delta.zip"
+                      and manifest["sha256"] == delta_expected, "Unexpected delta archive identity.")
+              total = positive_size(manifest["size"], "delta size")
+              parts = manifest["parts"]
+              require(isinstance(parts, list) and 1 <= len(parts) <= 512
+                      and len(parts) == (total + PART_SIZE - 1) // PART_SIZE, "Invalid delta part count.")
+              for index, part in enumerate(parts):
+                  require(isinstance(part, dict) and set(part) == {"name", "size", "sha256"}, "Invalid delta part schema.")
+                  require(part["name"] == f"transkript-upload-{tag}-delta-part-{index:03}.bin", "Invalid delta part name/order.")
+                  require(type(part["size"]) is int and part["size"] == min(PART_SIZE, total - index * PART_SIZE),
+                          "Invalid delta part size.")
+                  digest_value(part["sha256"], "delta part digest")
+              return total, parts
+
+          def read_delta_archive(archive, directory):
+              limits = {"manifest.json": 64 * 1024, "literals.bin": MAX_BYTES - 64 * 1024 - 1024,
+                        "base-raw-footer.bin": 512, "target-dmg-footer.bin": 512}
+              with zipfile.ZipFile(archive) as bundle:
+                  entries = bundle.infolist()
+                  require(len(entries) == 4 and {entry.filename for entry in entries} == set(limits),
+                          "Delta ZIP must contain exactly four named files, without duplicate members.")
+                  require(sum(entry.file_size for entry in entries) <= MAX_BYTES, "Delta ZIP exceeds the uncompressed limit.")
+                  for entry in entries:
+                      mode = entry.external_attr >> 16
+                      require(not entry.is_dir() and stat.S_IFMT(mode) in (0, stat.S_IFREG)
+                              and not (entry.flag_bits & 1) and entry.compress_type in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED),
+                              "Delta ZIP contains a symlink, directory, encrypted or unsupported member.")
+                      require(0 < entry.file_size <= limits[entry.filename], "Delta ZIP member exceeds its size limit.")
+                      path = directory / entry.filename
+                      size = 0
+                      # Fixed allowlisted paths; never extract archive-supplied paths.
+                      with bundle.open(entry) as source, path.open("xb") as destination:
+                          for block in iter(lambda: source.read(1024 * 1024), b""):
+                              size += len(block)
+                              require(size <= limits[entry.filename], "Expanded ZIP member exceeds its size limit.")
+                              destination.write(block)
+                      require(size == entry.file_size, "Expanded ZIP member has an unexpected size.")
+              return read_json(directory / "manifest.json")
+
+          def validate_delta(manifest, directory):
+              keys = {"version", "algorithm", "tag", "block_size", "base_dmg_sha256", "base_raw_size", "base_raw_sha256",
+                      "target_raw_size", "target_raw_sha256", "target_dmg_size", "target_dmg_sha256", "literals_size",
+                      "literals_sha256", "base_raw_footer_sha256", "target_dmg_footer_sha256", "ops"}
+              require(isinstance(manifest, dict) and set(manifest) == keys, "Delta manifest schema is invalid.")
+              require(type(manifest["version"]) is int and manifest["version"] == 1
+                      and manifest["algorithm"] == "block-copy-literal-v1" and manifest["tag"] == tag
+                      and type(manifest["block_size"]) is int and manifest["block_size"] == 4096,
+                      "Delta manifest algorithm/version/tag/block size is invalid.")
+              for name in keys:
+                  if name.endswith("_sha256"):
+                      digest_value(manifest[name], name)
+                  elif name.endswith("_size"):
+                      positive_size(manifest[name], name)
+              require(manifest["base_raw_size"] >= 512 and manifest["target_raw_size"] >= 512
+                      and manifest["target_dmg_size"] >= 512 and manifest["target_dmg_sha256"] == expected,
+                      "Delta does not reconstruct the expected installer.")
+              for filename, size, digest in (("literals.bin", manifest["literals_size"], manifest["literals_sha256"]),
+                      ("base-raw-footer.bin", 512, manifest["base_raw_footer_sha256"]),
+                      ("target-dmg-footer.bin", 512, manifest["target_dmg_footer_sha256"])):
+                  path = directory / filename
+                  require(path.stat().st_size == size and sha256(path) == digest, f"Delta member digest or size mismatch: {filename}.")
+              ops = manifest["ops"]
+              require(isinstance(ops, list) and 1 <= len(ops) <= 50000, "Invalid delta operation count.")
+              total = literal_end = 0
+              for op in ops:
+                  require(isinstance(op, dict) and (set(op) == {"copy_offset", "length"}
+                          or set(op) == {"literal_offset", "length"}), "Invalid delta operation schema.")
+                  length = positive_size(op["length"], "operation length")
+                  source = "copy_offset" if "copy_offset" in op else "literal_offset"
+                  offset = op[source]
+                  limit = manifest["base_raw_size"] if source == "copy_offset" else manifest["literals_size"]
+                  require(type(offset) is int and offset >= 0 and offset + length <= limit, "Delta operation is out of bounds.")
+                  if source == "literal_offset":
+                      require(offset == literal_end, "Delta literals are not consumed exactly in order.")
+                      literal_end += length
+                  total += length
+                  require(total <= manifest["target_raw_size"], "Delta output exceeds target size.")
+              require(total == manifest["target_raw_size"] and literal_end == manifest["literals_size"],
+                      "Delta operation totals differ from the manifest.")
+              return manifest
+
+          def overwrite_footer(path, footer):
+              require(path.stat().st_size >= 512 and footer.stat().st_size == 512, "Invalid image footer size.")
+              with path.open("r+b") as destination:
+                  destination.seek(-512, os.SEEK_END)
+                  destination.write(footer.read_bytes())
+
+          def apply_ops(base_path, literals_path, target_path, manifest):
+              with base_path.open("rb") as base, literals_path.open("rb") as literals, target_path.open("xb") as target:
+                  for op in manifest["ops"]:
+                      source = base if "copy_offset" in op else literals
+                      source.seek(op.get("copy_offset", op.get("literal_offset")))
+                      remaining = op["length"]
+                      while remaining:
+                          block = source.read(min(remaining, 1024 * 1024))
+                          require(bool(block), "Delta source ended before the declared operation length.")
+                          target.write(block)
+                          remaining -= len(block)
+              require(target_path.stat().st_size == manifest["target_raw_size"]
+                      and sha256(target_path) == manifest["target_raw_sha256"], "Reconstructed raw image does not match target.")
+
+          def main():
+              require(os.environ.get("GITHUB_REPOSITORY") == REPOSITORY, "Unexpected repository.")
+              require(re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", tag) is not None,
+                      "Tag must be a stable semantic version.")
+              digest_value(expected, "expected installer SHA-256")
+              digest_value(delta_expected, "expected delta SHA-256")
+              release_id = read_draft()["id"]
+              initial = assets(release_id)
+              manifest_meta = uploaded(initial.get(manifest_name), manifest_name)
+              require(manifest_meta["size"] <= 256 * 1024, "Transport manifest exceeds its size limit.")
+              for name, limit in SMALL_LIMITS.items():
+                  require(uploaded(initial.get(name), name)["size"] <= limit, f"Asset exceeds its size limit: {name}.")
+              with tempfile.TemporaryDirectory(prefix="transkript-installer-delta-") as folder:
+                  directory = Path(folder)
+                  transport = read_json(download(manifest_name, directory, manifest_meta))
+                  delta_size, parts = validate_transport(transport)
+                  for part in parts:
+                      uploaded(initial.get(part["name"]), part["name"], part["size"], part["sha256"])
+                  feed = read_json(download("version.json", directory, initial["version.json"]))
+                  validate_feed(feed, download("SHA256SUMS.txt", directory, initial["SHA256SUMS.txt"]))
+                  with ThreadPoolExecutor(max_workers=4) as executor:
+                      paths = list(executor.map(lambda part: download(part["name"], directory, initial[part["name"]]), parts))
+                  archive = directory / transport["filename"]
+                  with archive.open("xb") as output:
+                      for path in paths:
+                          with path.open("rb") as source:
+                              for block in iter(lambda: source.read(1024 * 1024), b""):
+                                  output.write(block)
+                  require(archive.stat().st_size == delta_size and sha256(archive) == delta_expected,
+                          "Reassembled delta archive does not match expected size and SHA-256.")
+                  manifest = validate_delta(read_delta_archive(archive, directory), directory)
+                  if PRIMARY in initial:
+                      uploaded(initial[PRIMARY], PRIMARY, manifest["target_dmg_size"], expected)
+                      if ALIAS in initial:
+                          uploaded(initial[ALIAS], ALIAS, manifest["target_dmg_size"], expected)
+                      read_draft(release_id)
+                      same_assets(initial, assets(release_id))
+                      print("Transkript.dmg already has the expected size and digest; nothing overwritten and draft remains unpublished.")
+                      return
+                  if ALIAS in initial:
+                      uploaded(initial[ALIAS], ALIAS, manifest["target_dmg_size"], expected)
+                  base_release = api(f"repos/{REPOSITORY}/releases/tags/{BASE_TAG}")
+                  require(base_release.get("tag_name") == BASE_TAG and base_release.get("draft") is False
+                          and base_release.get("prerelease") is False and type(base_release.get("id")) is int,
+                          "Base installer must belong to the published stable baseline release.")
+                  base_meta = uploaded(assets(base_release["id"]).get(PRIMARY), PRIMARY, digest=manifest["base_dmg_sha256"])
+                  require(base_meta["size"] <= MAX_BYTES, "Base installer exceeds its size limit.")
+                  base_directory = directory / "base"
+                  base_directory.mkdir()
+                  base_dmg = download(PRIMARY, base_directory, base_meta)
+                  base_raw = directory / "base-raw.dmg"
+                  command("hdiutil", "convert", str(base_dmg), "-format", "UDRO", "-o", str(base_raw))
+                  overwrite_footer(base_raw, directory / "base-raw-footer.bin")
+                  require(base_raw.stat().st_size == manifest["base_raw_size"]
+                          and sha256(base_raw) == manifest["base_raw_sha256"], "Baseline raw image does not match delta base.")
+                  target_raw = directory / "target-raw.dmg"
+                  apply_ops(base_raw, directory / "literals.bin", target_raw, manifest)
+                  primary = directory / PRIMARY
+                  command("hdiutil", "convert", str(target_raw), "-format", "UDZO", "-imagekey", "zlib-level=9", "-o", str(primary))
+                  overwrite_footer(primary, directory / "target-dmg-footer.bin")
+                  require(primary.stat().st_size == manifest["target_dmg_size"] and sha256(primary) == expected,
+                          "Reconstructed DMG does not match the locally verified installer byte for byte.")
+                  command("hdiutil", "verify", str(primary))
+                  read_draft(release_id)
+                  same_assets(initial, assets(release_id))
+                  print(f"Verified delta and exact installer ({manifest['target_dmg_size']} bytes); uploading only Transkript.dmg.")
+                  command("gh", "release", "upload", tag, "--repo", REPOSITORY, str(primary))
+                  read_draft(release_id)
+                  final = assets(release_id)
+                  same_assets(initial, final, (PRIMARY,))
+                  uploaded(final.get(PRIMARY), PRIMARY, manifest["target_dmg_size"], expected)
+                  print(f"Installer restored with SHA-256 {expected}. Other assets retained; draft remains unpublished.")
+
+          try:
+              main()
+          except (ValueError, RuntimeError, OSError, json.JSONDecodeError, zipfile.BadZipFile, EOFError) as error:
+              raise SystemExit(f"Delta restoration refused: {error}") from None
+          PY
